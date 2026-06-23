@@ -1,9 +1,8 @@
-import threading
-import tkinter as tk
-from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext
+from io import BytesIO
+from datetime import date
 
 import pandas as pd
+import streamlit as st
 import yfinance as yf
 
 
@@ -50,19 +49,14 @@ def get_decision(score):
 # MAIN ANALYSIS FUNCTION
 # =========================
 
-def create_historical_stock_excel(ticker, start_date, end_date, output_file, progress_callback=None):
+def create_historical_stock_dataframe(ticker, start_date, end_date, progress_callback=None):
     ticker = ticker.strip().upper()
-    start_date = start_date.strip()
-    end_date = end_date.strip()
 
     if not ticker:
         raise ValueError("Please enter a ticker.")
-    if not start_date:
-        raise ValueError("Please enter a start date, for example 2020-01-01.")
-    if not end_date:
-        raise ValueError("Please enter an end date, for example 2026-06-15.")
-    if not output_file:
-        raise ValueError("Please choose where to save the Excel file.")
+
+    if start_date >= end_date:
+        raise ValueError("The end date must be after the start date.")
 
     if progress_callback:
         progress_callback(f"Downloading historical data for {ticker}...")
@@ -80,6 +74,11 @@ def create_historical_stock_excel(ticker, start_date, end_date, output_file, pro
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
+
+    required_columns = {"Open", "High", "Low", "Close", "Volume"}
+    missing_columns = required_columns - set(data.columns)
+    if missing_columns:
+        raise ValueError(f"Missing expected columns from Yahoo Finance: {', '.join(sorted(missing_columns))}")
 
     if progress_callback:
         progress_callback("Calculating indicators...")
@@ -174,7 +173,7 @@ def create_historical_stock_excel(ticker, start_date, end_date, output_file, pro
     data["TECHNICAL_DECISION"] = data["TOTAL_SCORE"].apply(get_decision)
 
     # =========================
-    # PREPARE FOR EXCEL
+    # PREPARE FOR EXCEL / DISPLAY
     # =========================
 
     data.reset_index(inplace=True)
@@ -206,168 +205,108 @@ def create_historical_stock_excel(ticker, start_date, end_date, output_file, pro
     ]
 
     existing_columns = [column for column in preferred_columns if column in data.columns]
-    data = data[existing_columns]
+    return data[existing_columns]
 
-    if progress_callback:
-        progress_callback("Saving Excel file...")
 
-    output_path = Path(output_file)
-    data.to_excel(output_path, index=False)
+def dataframe_to_excel_bytes(dataframe):
+    output = BytesIO()
 
-    if progress_callback:
-        progress_callback(f"Done! File saved to: {output_path}")
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe.to_excel(writer, index=False, sheet_name="Historical Data")
 
-    return output_path
+        worksheet = writer.sheets["Historical Data"]
+        for column_cells in worksheet.columns:
+            max_length = 0
+            column_letter = column_cells[0].column_letter
+
+            for cell in column_cells:
+                value = "" if cell.value is None else str(cell.value)
+                max_length = max(max_length, len(value))
+
+            worksheet.column_dimensions[column_letter].width = min(max_length + 2, 45)
+
+    output.seek(0)
+    return output.getvalue()
 
 
 # =========================
-# GUI APPLICATION
+# STREAMLIT APPLICATION
 # =========================
 
-class HistoricalStockGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Historical Stock Data with Indicators")
-        self.root.geometry("820x520")
-        self.root.minsize(720, 450)
+st.set_page_config(
+    page_title="Historical Stock Data with Indicators",
+    page_icon="📈",
+    layout="wide",
+)
 
-        self.ticker_var = tk.StringVar()
-        self.start_date_var = tk.StringVar(value="2020-01-01")
-        self.end_date_var = tk.StringVar(value="2026-06-15")
-        self.output_file_var = tk.StringVar()
+st.title("Historical Stock Data with Indicators")
+st.write("Enter a ticker and date range. The app will calculate SMA, RSI, MACD, scores, and export the result to Excel.")
 
-        self.run_button = None
-        self.browse_button = None
-        self.status_label = None
-        self.output_box = None
+with st.sidebar:
+    st.header("Inputs")
 
-        self.create_widgets()
+    ticker = st.text_input("Ticker", value="AAPL").strip().upper()
 
-    def create_widgets(self):
-        main_frame = tk.Frame(self.root, padx=12, pady=12)
-        main_frame.pack(fill="both", expand=True)
-        main_frame.columnconfigure(1, weight=1)
+    start_date = st.date_input(
+        "From date",
+        value=date(2020, 1, 1),
+    )
 
-        tk.Label(main_frame, text="Ticker:").grid(row=0, column=0, sticky="w", pady=5)
-        tk.Entry(main_frame, textvariable=self.ticker_var, width=20).grid(
-            row=0, column=1, sticky="w", pady=5
-        )
+    end_date = st.date_input(
+        "To date",
+        value=date.today(),
+    )
 
-        tk.Label(main_frame, text="From date:").grid(row=1, column=0, sticky="w", pady=5)
-        tk.Entry(main_frame, textvariable=self.start_date_var, width=20).grid(
-            row=1, column=1, sticky="w", pady=5
-        )
-        tk.Label(main_frame, text="Example: 2020-01-01").grid(row=1, column=2, sticky="w", padx=8)
+    run_analysis = st.button("Download and prepare Excel", type="primary")
 
-        tk.Label(main_frame, text="To date:").grid(row=2, column=0, sticky="w", pady=5)
-        tk.Entry(main_frame, textvariable=self.end_date_var, width=20).grid(
-            row=2, column=1, sticky="w", pady=5
-        )
-        tk.Label(main_frame, text="Example: 2026-06-15").grid(row=2, column=2, sticky="w", padx=8)
+if run_analysis:
+    log_messages = []
 
-        tk.Label(main_frame, text="Save Excel as:").grid(row=3, column=0, sticky="w", pady=5)
-        tk.Entry(main_frame, textvariable=self.output_file_var).grid(
-            row=3, column=1, sticky="ew", pady=5
-        )
-        self.browse_button = tk.Button(main_frame, text="Browse", command=self.choose_output_file)
-        self.browse_button.grid(row=3, column=2, sticky="w", padx=8)
+    def add_log(message):
+        log_messages.append(message)
 
-        button_frame = tk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 8))
-
-        self.run_button = tk.Button(
-            button_frame,
-            text="Download and Save Excel",
-            command=self.start_download_thread,
-            height=2,
-            width=24,
-        )
-        self.run_button.pack(side="left")
-
-        tk.Button(
-            button_frame,
-            text="Clear Log",
-            command=self.clear_log,
-            height=2,
-            width=14,
-        ).pack(side="left", padx=8)
-
-        self.status_label = tk.Label(main_frame, text="Ready", anchor="w")
-        self.status_label.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5, 5))
-
-        self.output_box = scrolledtext.ScrolledText(main_frame, wrap="word", height=16)
-        self.output_box.grid(row=6, column=0, columnspan=3, sticky="nsew")
-        main_frame.rowconfigure(6, weight=1)
-
-    def choose_output_file(self):
-        ticker = self.ticker_var.get().strip().upper() or "STOCK"
-        default_name = f"{ticker}_historical_data_with_indicators_and_score.xlsx"
-
-        filename = filedialog.asksaveasfilename(
-            title="Save Excel file as",
-            initialfile=default_name,
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
-        )
-
-        if filename:
-            self.output_file_var.set(filename)
-
-    def append_log(self, message):
-        self.output_box.insert(tk.END, message + "\n")
-        self.output_box.see(tk.END)
-
-    def set_status(self, message):
-        self.status_label.config(text=message)
-
-    def clear_log(self):
-        self.output_box.delete("1.0", tk.END)
-        self.set_status("Ready")
-
-    def start_download_thread(self):
-        ticker = self.ticker_var.get().strip().upper()
-
-        if not ticker:
-            messagebox.showerror("Missing ticker", "Please enter a ticker, for example AAPL.")
-            return
-
-        if not self.output_file_var.get().strip():
-            default_file = Path.cwd() / f"{ticker}_historical_data_with_indicators_and_score.xlsx"
-            self.output_file_var.set(str(default_file))
-
-        self.run_button.config(state="disabled")
-        self.set_status("Working...")
-        self.append_log(f"Starting download for {ticker}...")
-
-        worker = threading.Thread(target=self.run_download, daemon=True)
-        worker.start()
-
-    def gui_progress(self, message):
-        self.root.after(0, lambda: self.append_log(message))
-
-    def run_download(self):
-        try:
-            output_path = create_historical_stock_excel(
-                ticker=self.ticker_var.get(),
-                start_date=self.start_date_var.get(),
-                end_date=self.end_date_var.get(),
-                output_file=self.output_file_var.get(),
-                progress_callback=self.gui_progress,
+    try:
+        with st.spinner("Working..."):
+            result = create_historical_stock_dataframe(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date,
+                progress_callback=add_log,
             )
 
-            self.root.after(0, lambda: self.set_status("Done."))
-            self.root.after(0, lambda: messagebox.showinfo("Done", f"Excel file saved to:\n{output_path}"))
+            excel_bytes = dataframe_to_excel_bytes(result)
 
-        except (FileNotFoundError, PermissionError, ValueError, KeyError, TypeError, OSError) as error:
-            self.root.after(0, lambda: self.set_status("Error"))
-            self.root.after(0, lambda: self.append_log(f"ERROR: {error}"))
-            self.root.after(0, lambda: messagebox.showerror("Error", str(error)))
+        st.success("Done. Your file is ready.")
 
-        finally:
-            self.root.after(0, lambda: self.run_button.config(state="normal"))
+        if log_messages:
+            with st.expander("Log"):
+                for message in log_messages:
+                    st.write(message)
 
+        latest_row = result.tail(1)
 
-if __name__ == "__main__":
-    root_window = tk.Tk()
-    app = HistoricalStockGUI(root_window)
-    root_window.mainloop()
+        st.subheader("Latest Technical Decision")
+        if not latest_row.empty:
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric("Ticker", ticker)
+            col2.metric("Total Score", int(latest_row["TOTAL_SCORE"].iloc[0]))
+            col3.metric("Decision", str(latest_row["TECHNICAL_DECISION"].iloc[0]))
+            col4.metric("Last Close", f"{float(latest_row['Close'].iloc[0]):,.2f}")
+
+        st.subheader("Preview")
+        st.dataframe(result.tail(20), use_container_width=True)
+
+        file_name = f"{ticker}_historical_data_with_indicators_and_score.xlsx"
+
+        st.download_button(
+            label="Download Excel file",
+            data=excel_bytes,
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except Exception as error:
+        st.error(str(error))
+else:
+    st.info("Enter a ticker and dates, then click the button in the sidebar.")
